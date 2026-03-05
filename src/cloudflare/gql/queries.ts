@@ -908,3 +908,68 @@ export const NetworkAnalyticsQuery = graphql(`
     }
   }
 `);
+
+/**
+ * Cloudflare Stream video playback metrics.
+ * Groups minutes viewed by country and media type.
+ * uid and creator are intentionally omitted (high cardinality).
+ */
+export const StreamVideoPlaybackQuery = graphql(`
+  query StreamVideoPlayback(
+    $accountID: string!
+    $limit: uint64!
+    $mintime: Time!
+    $maxtime: Time!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        streamMinutesViewedAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          count
+          sum {
+            minutesViewed
+          }
+          dimensions {
+            clientCountryName
+            mediaType
+          }
+        }
+      }
+    }
+  }
+`);
+
+/**
+ * Cloudflare Stream live input (input stream) metrics.
+ * Groups segment counts and bit rate by event code.
+ * inputId is intentionally omitted (high cardinality).
+ */
+export const StreamLiveInputsQuery = graphql(`
+  query StreamLiveInputs(
+    $accountID: string!
+    $limit: uint64!
+    $mintime: Time!
+    $maxtime: Time!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        liveInputEventsAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          count
+          avg {
+            bitRate
+            gopDuration
+            uploadDurationRatio
+          }
+          dimensions {
+            eventCode
+          }
+        }
+      }
+    }
+  }
+`);

@@ -40,6 +40,8 @@ import {
 	NetworkAnalyticsQuery,
 	OriginStatusMetricsQuery,
 	RequestMethodMetricsQuery,
+	StreamLiveInputsQuery,
+	StreamVideoPlaybackQuery,
 	WorkerTotalsQuery,
 } from "./gql/queries";
 import type { AccountLevelQuery, ZoneLevelQuery } from "./queries";
@@ -515,6 +517,18 @@ export class CloudflareMetricsClient {
 				);
 			case "network-analytics":
 				return this.getNetworkAnalyticsMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
+			case "stream-video-playback":
+				return this.getStreamVideoPlaybackMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
+			case "stream-live-inputs":
+				return this.getStreamLiveInputsMetrics(
 					accountId,
 					normalizedAccount,
 					timeRange,
@@ -1296,6 +1310,151 @@ export class CloudflareMetricsClient {
 		}
 
 		metrics.push(bits, packets);
+	}
+
+	/**
+	 * Fetches Cloudflare Stream video playback metrics.
+	 * Returns playback starts and time viewed, grouped by country and device type.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 */
+	private async getStreamVideoPlaybackMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(StreamVideoPlaybackQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+		if (result.error) {
+			this.logger.error("GraphQL error (stream-video-playback)", {
+				account: normalizedAccount,
+				error: result.error.message,
+			});
+			return [];
+		}
+
+		const playbackStarts: MetricDefinition = {
+			name: "cloudflare_stream_video_playback_starts_total",
+			help: "Total number of Cloudflare Stream video playback starts",
+			type: "counter",
+			values: [],
+		};
+		const minutesViewed: MetricDefinition = {
+			name: "cloudflare_stream_video_playback_time_viewed_minutes_total",
+			help: "Total minutes of Cloudflare Stream video viewed",
+			type: "counter",
+			values: [],
+		};
+
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			for (const group of accountData.streamMinutesViewedAdaptiveGroups ?? []) {
+				const dims = group.dimensions;
+				if (dims == null) continue;
+
+				const labels = {
+					account: normalizedAccount,
+					country: dims.clientCountryName ?? "",
+					media_type: dims.mediaType ?? "",
+				};
+
+				playbackStarts.values.push({ labels, value: group.count ?? 0 });
+				minutesViewed.values.push({
+					labels,
+					value: group.sum?.minutesViewed ?? 0,
+				});
+			}
+		}
+		return [playbackStarts, minutesViewed].filter((m) => m.values.length > 0);
+	}
+
+	/**
+	 * Fetches Cloudflare Stream live input (input stream) metrics.
+	 * Returns segment counts and ingestion quality gauges, grouped by event code.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 */
+	private async getStreamLiveInputsMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(StreamLiveInputsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			this.logger.error("GraphQL error (stream-live-inputs)", {
+				account: normalizedAccount,
+				error: result.error.message,
+			});
+			return [];
+		}
+
+		const segments: MetricDefinition = {
+			name: "cloudflare_stream_live_input_segments_total",
+			help: "Total number of Cloudflare Stream live input segments ingested",
+			type: "counter",
+			values: [],
+		};
+		const bitRate: MetricDefinition = {
+			name: "cloudflare_stream_live_input_bit_rate_bps",
+			help: "Average ingestion bit rate for Cloudflare Stream live inputs in bits per second",
+			type: "gauge",
+			values: [],
+		};
+		const gopDuration: MetricDefinition = {
+			name: "cloudflare_stream_live_input_gop_duration_milliseconds",
+			help: "Average GOP duration for Cloudflare Stream live inputs in milliseconds",
+			type: "gauge",
+			values: [],
+		};
+		const uploadRatio: MetricDefinition = {
+			name: "cloudflare_stream_live_input_upload_duration_ratio",
+			help: "Average upload-to-duration ratio for Cloudflare Stream live inputs",
+			type: "gauge",
+			values: [],
+		};
+
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			for (const group of accountData.liveInputEventsAdaptiveGroups ?? []) {
+				const dims = group.dimensions;
+				if (dims == null) continue;
+
+				const labels = {
+					account: normalizedAccount,
+					event_code: dims.eventCode ?? "",
+				};
+
+				segments.values.push({ labels, value: group.count ?? 0 });
+				bitRate.values.push({
+					labels,
+					value: group.avg?.bitRate ?? 0,
+				});
+				gopDuration.values.push({
+					labels,
+					value: group.avg?.gopDuration ?? 0,
+				});
+				uploadRatio.values.push({
+					labels,
+					value: group.avg?.uploadDurationRatio ?? 0,
+				});
+			}
+		}
+
+		return [segments, bitRate, gopDuration, uploadRatio].filter(
+			(m) => m.values.length > 0,
+		);
 	}
 
 	/**
