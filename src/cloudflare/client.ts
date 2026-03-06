@@ -33,7 +33,10 @@ import {
 	LoadBalancerMetricsQuery,
 	LogpushAccountMetricsQuery,
 	LogpushZoneMetricsQuery,
+	MagicFirewallSamplesQuery,
 	MagicTransitMetricsQuery,
+	MagicTransitSLOMetricsQuery,
+	MagicTransitTunnelTrafficQuery,
 	NetworkAnalyticsQuery,
 	OriginStatusMetricsQuery,
 	RequestMethodMetricsQuery,
@@ -72,6 +75,29 @@ function groupStatusCode(code: number): string {
 	if (code < 400) return "3xx";
 	if (code < 500) return "4xx";
 	return "5xx";
+}
+
+/**
+ * Cloudflare tunnel health state encoding:
+ *   0 = down, 0.5 = degraded, 1 = healthy
+ *
+ * Thresholds are midpoints between adjacent states, used to classify
+ * a weighted-average health score into a discrete state.
+ */
+const TUNNEL_HEALTHY_THRESHOLD = 0.75;
+const TUNNEL_DEGRADED_THRESHOLD = 0.25;
+
+/** Classify a weighted-average tunnel health score into a discrete StateSet. */
+function classifyTunnelState(avgScore: number): {
+	healthy: 0 | 1;
+	degraded: 0 | 1;
+	down: 0 | 1;
+} {
+	if (avgScore >= TUNNEL_HEALTHY_THRESHOLD)
+		return { healthy: 1, degraded: 0, down: 0 };
+	if (avgScore >= TUNNEL_DEGRADED_THRESHOLD)
+		return { healthy: 0, degraded: 1, down: 0 };
+	return { healthy: 0, degraded: 0, down: 1 };
 }
 
 /**
@@ -469,6 +495,24 @@ export class CloudflareMetricsClient {
 					normalizedAccount,
 					timeRange,
 				);
+			case "magic-transit-slo":
+				return this.getMagicTransitSLOMetricsInternal(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
+			case "magic-transit-traffic":
+				return this.getMagicTransitTunnelTrafficMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
+			case "magic-firewall-samples":
+				return this.getMagicFirewallSamplesMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
 			case "network-analytics":
 				return this.getNetworkAnalyticsMetrics(
 					accountId,
@@ -690,58 +734,132 @@ export class CloudflareMetricsClient {
 			type: "gauge",
 			values: [],
 		};
+		const failureByStatus: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_failure_by_status",
+			help: "Magic Transit tunnel health check failures broken down by result status",
+			type: "gauge",
+			values: [],
+		};
+		const tunnelStateHealthy: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_state_healthy",
+			help: "Magic Transit tunnel is in healthy state (1=yes, 0=no)",
+			type: "gauge",
+			values: [],
+		};
+		const tunnelStateDegraded: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_state_degraded",
+			help: "Magic Transit tunnel is in degraded state (1=yes, 0=no)",
+			type: "gauge",
+			values: [],
+		};
+		const tunnelStateDown: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_state_down",
+			help: "Magic Transit tunnel is in down state (1=yes, 0=no)",
+			type: "gauge",
+			values: [],
+		};
 
 		for (const accountData of result.data?.viewer?.accounts ?? []) {
 			const groups =
 				accountData.magicTransitTunnelHealthChecksAdaptiveGroups ?? [];
 
-			// Group by tunnel for aggregation
-			const byTunnel = new Map<string, (typeof groups)[number][]>();
+			// Group by (tunnelName, siteName) for aggregation
+			const byTunnel = new Map<
+				string,
+				Map<string, (typeof groups)[number][]>
+			>();
 			for (const g of groups) {
-				const key = `${g.dimensions?.tunnelName ?? ""}:${g.dimensions?.siteName ?? ""}`;
-				const existing = byTunnel.get(key);
+				const tName = g.dimensions?.tunnelName ?? "";
+				const sName = g.dimensions?.siteName ?? "";
+				let bySite = byTunnel.get(tName);
+				if (!bySite) {
+					bySite = new Map();
+					byTunnel.set(tName, bySite);
+				}
+				const existing = bySite.get(sName);
 				if (existing) {
 					existing.push(g);
 				} else {
-					byTunnel.set(key, [g]);
+					bySite.set(sName, [g]);
 				}
 			}
 
-			for (const [key, tunnelGroups] of byTunnel) {
-				const [tunnelName, siteName] = key.split(":");
-				const labels = {
-					account: normalizedAccount,
-					tunnel_name: tunnelName ?? "",
-					site_name: siteName ?? "",
-				};
+			for (const [tunnelName, bySite] of byTunnel) {
+				for (const [siteName, tunnelGroups] of bySite) {
+					const labels = {
+						account: normalizedAccount,
+						tunnel_name: tunnelName,
+						site_name: siteName,
+					};
 
-				// Active: count where active=true
-				const active = tunnelGroups
-					.filter((g) => String(g.dimensions?.active) === "true")
-					.reduce((sum, g) => sum + (g.count ?? 0), 0);
-				if (active > 0) activeTunnels.values.push({ labels, value: active });
+					// Active: count where active=1 (uint8 boolean in CF schema)
+					const active = tunnelGroups
+						.filter((g) => (g.dimensions?.active ?? 0) === 1)
+						.reduce((sum, g) => sum + (g.count ?? 0), 0);
+					if (active > 0) activeTunnels.values.push({ labels, value: active });
 
-				// Healthy: resultStatus === "healthy"
-				const healthy = tunnelGroups
-					.filter((g) => g.dimensions?.resultStatus === "healthy")
-					.reduce((sum, g) => sum + (g.count ?? 0), 0);
-				if (healthy > 0) healthyTunnels.values.push({ labels, value: healthy });
+					// Healthy: resultStatus === "healthy"
+					const healthy = tunnelGroups
+						.filter((g) => g.dimensions?.resultStatus === "healthy")
+						.reduce((sum, g) => sum + (g.count ?? 0), 0);
+					if (healthy > 0)
+						healthyTunnels.values.push({ labels, value: healthy });
 
-				// Failures: resultStatus !== "healthy"
-				const failures = tunnelGroups
-					.filter((g) => g.dimensions?.resultStatus !== "healthy")
-					.reduce((sum, g) => sum + (g.count ?? 0), 0);
-				if (failures > 0)
-					tunnelFailures.values.push({ labels, value: failures });
+					// Failures: resultStatus !== "healthy"
+					const failures = tunnelGroups
+						.filter((g) => g.dimensions?.resultStatus !== "healthy")
+						.reduce((sum, g) => sum + (g.count ?? 0), 0);
+					if (failures > 0)
+						tunnelFailures.values.push({ labels, value: failures });
 
-				// Edge colo count: distinct colos
-				const colos = new Set(
-					tunnelGroups
-						.map((g) => g.dimensions?.edgeColoCity)
-						.filter((c): c is string => c != null && c !== ""),
-				);
-				if (colos.size > 0)
-					edgeColoCount.values.push({ labels, value: colos.size });
+					// Failures by status: group non-healthy results by resultStatus
+					const byStatus = new Map<string, number>();
+					for (const g of tunnelGroups) {
+						const status = g.dimensions?.resultStatus ?? "";
+						if (status === "healthy" || status === "") continue;
+						byStatus.set(status, (byStatus.get(status) ?? 0) + (g.count ?? 0));
+					}
+					for (const [status, count] of byStatus) {
+						if (count > 0) {
+							failureByStatus.values.push({
+								labels: { ...labels, result_status: status },
+								value: count,
+							});
+						}
+					}
+
+					// Edge colo count: distinct colos
+					const colos = new Set(
+						tunnelGroups
+							.map((g) => g.dimensions?.edgeColoCity)
+							.filter((c): c is string => c != null && c !== ""),
+					);
+					if (colos.size > 0)
+						edgeColoCount.values.push({ labels, value: colos.size });
+
+					// Tunnel state: weighted average of avg.tunnelState across colos,
+					// then thresholded into a StateSet-style triple of boolean gauges.
+					// CF encodes: 0 = down, 0.5 = degraded, 1 = healthy.
+					let stateWeight = 0;
+					let weightedState = 0;
+					for (const g of tunnelGroups) {
+						const weight = g.count ?? 0;
+						const state = g.avg?.tunnelState;
+						if (weight > 0 && state != null) {
+							stateWeight += weight;
+							weightedState += state * weight;
+						}
+					}
+					if (stateWeight > 0) {
+						const state = classifyTunnelState(weightedState / stateWeight);
+						tunnelStateHealthy.values.push({ labels, value: state.healthy });
+						tunnelStateDegraded.values.push({
+							labels,
+							value: state.degraded,
+						});
+						tunnelStateDown.values.push({ labels, value: state.down });
+					}
+				}
 			}
 		}
 
@@ -750,7 +868,271 @@ export class CloudflareMetricsClient {
 			healthyTunnels,
 			tunnelFailures,
 			edgeColoCount,
+			failureByStatus,
+			tunnelStateHealthy,
+			tunnelStateDegraded,
+			tunnelStateDown,
 		].filter((m) => m.values.length > 0);
+	}
+
+	/**
+	 * Magic Transit tunnel health check SLO metrics (status, effective SLO, target SLO).
+	 *
+	 * Uses the magicTransitTunnelHealthCheckSLOsAdaptiveGroups dataset which provides
+	 * authoritative tunnel health status based on SLO calculations.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Magic Transit SLO metrics.
+	 */
+	private async getMagicTransitSLOMetricsInternal(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(MagicTransitSLOMetricsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			this.logger.error("GraphQL error (magic-transit-slo)", {
+				error: result.error.message,
+			});
+			return [];
+		}
+
+		const sloStatus: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_slo_status",
+			help: "Magic Transit tunnel health check SLO status count per tunnel and status",
+			type: "gauge",
+			values: [],
+		};
+		const effectiveSlo: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_effective_slo",
+			help: "Magic Transit tunnel effective SLO (0.0-1.0 availability ratio)",
+			type: "gauge",
+			values: [],
+		};
+		const targetSlo: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_target_slo",
+			help: "Magic Transit tunnel configured target SLO threshold",
+			type: "gauge",
+			values: [],
+		};
+
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			const groups =
+				accountData.magicTransitTunnelHealthCheckSLOsAdaptiveGroups ?? [];
+
+			// Group by (tunnelName, siteName) for aggregation
+			const byTunnel = new Map<
+				string,
+				Map<string, (typeof groups)[number][]>
+			>();
+			for (const g of groups) {
+				const dims = g.dimensions;
+				if (dims == null) continue;
+				const tName = dims.tunnelName ?? "";
+				const sName = dims.siteName ?? "";
+				let bySite = byTunnel.get(tName);
+				if (!bySite) {
+					bySite = new Map();
+					byTunnel.set(tName, bySite);
+				}
+				const existing = bySite.get(sName);
+				if (existing) {
+					existing.push(g);
+				} else {
+					bySite.set(sName, [g]);
+				}
+			}
+
+			for (const [tunnelName, bySite] of byTunnel) {
+				for (const [siteName, tunnelGroups] of bySite) {
+					const baseLabels = {
+						account: normalizedAccount,
+						tunnel_name: tunnelName,
+						site_name: siteName,
+					};
+
+					// SLO status: count per {tunnel, status} combination
+					const byStatus = new Map<string, number>();
+					for (const g of tunnelGroups) {
+						const dims = g.dimensions;
+						if (dims == null) continue;
+						const status = dims.status ?? "";
+						if (status === "") continue;
+						byStatus.set(status, (byStatus.get(status) ?? 0) + (g.count ?? 0));
+					}
+					for (const [status, count] of byStatus) {
+						if (count > 0) {
+							sloStatus.values.push({
+								labels: { ...baseLabels, status },
+								value: count,
+							});
+						}
+					}
+
+					// Effective SLO: weighted average across groups for the tunnel
+					let totalWeight = 0;
+					let weightedEffective = 0;
+					let weightedTarget = 0;
+					for (const g of tunnelGroups) {
+						const weight = g.count ?? 0;
+						if (weight === 0) continue;
+						totalWeight += weight;
+						weightedEffective += (g.avg?.effectiveSlo ?? 0) * weight;
+						weightedTarget += (g.avg?.slo ?? 0) * weight;
+					}
+
+					if (totalWeight > 0) {
+						effectiveSlo.values.push({
+							labels: baseLabels,
+							value: weightedEffective / totalWeight,
+						});
+						targetSlo.values.push({
+							labels: baseLabels,
+							value: weightedTarget / totalWeight,
+						});
+					}
+				}
+			}
+		}
+
+		return [sloStatus, effectiveSlo, targetSlo].filter(
+			(m) => m.values.length > 0,
+		);
+	}
+
+	/**
+	 * Magic Transit tunnel bandwidth metrics (bits/packets per tunnel).
+	 *
+	 * Uses magicTransitTunnelTrafficAdaptiveGroups for per-tunnel throughput
+	 * with direction, on-ramp, and off-ramp breakdowns.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Magic Transit tunnel traffic metrics.
+	 */
+	private async getMagicTransitTunnelTrafficMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(MagicTransitTunnelTrafficQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			this.logger.error("GraphQL error (magic-transit-traffic)", {
+				error: result.error.message,
+			});
+			return [];
+		}
+
+		const bits: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_traffic_bits_total",
+			help: "Magic Transit tunnel bandwidth in bits",
+			type: "counter",
+			values: [],
+		};
+		const packets: MetricDefinition = {
+			name: "cloudflare_magic_transit_tunnel_traffic_packets_total",
+			help: "Magic Transit tunnel packets",
+			type: "counter",
+			values: [],
+		};
+
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			for (const group of accountData.magicTransitTunnelTrafficAdaptiveGroups ??
+				[]) {
+				const dims = group.dimensions;
+				if (dims == null) continue;
+
+				const labels: Record<string, string> = {
+					account: normalizedAccount,
+					tunnel_name: dims.tunnelName ?? "",
+					direction: dims.direction ?? "",
+					on_ramp: dims.onRamp ?? "",
+					off_ramp: dims.offRamp ?? "",
+				};
+
+				bits.values.push({ labels, value: group.sum?.bits ?? 0 });
+				packets.values.push({ labels, value: group.sum?.packets ?? 0 });
+			}
+		}
+
+		return [bits, packets].filter((m) => m.values.length > 0);
+	}
+
+	/**
+	 * Magic Firewall per-rule sampled traffic metrics.
+	 *
+	 * Uses magicFirewallSamplesAdaptiveGroups to show bits/packets
+	 * allowed and blocked by specific Magic Firewall rules.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Magic Firewall per-rule metrics.
+	 */
+	private async getMagicFirewallSamplesMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(MagicFirewallSamplesQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			this.logger.error("GraphQL error (magic-firewall-samples)", {
+				error: result.error.message,
+			});
+			return [];
+		}
+
+		const bits: MetricDefinition = {
+			name: "cloudflare_magic_firewall_rule_bits_total",
+			help: "Magic Firewall sampled traffic bits per rule",
+			type: "counter",
+			values: [],
+		};
+		const packets: MetricDefinition = {
+			name: "cloudflare_magic_firewall_rule_packets_total",
+			help: "Magic Firewall sampled traffic packets per rule",
+			type: "counter",
+			values: [],
+		};
+
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			for (const group of accountData.magicFirewallSamplesAdaptiveGroups ??
+				[]) {
+				const dims = group.dimensions;
+				if (dims == null) continue;
+
+				const labels: Record<string, string> = {
+					account: normalizedAccount,
+					rule_id: dims.ruleId ?? "",
+				};
+
+				bits.values.push({ labels, value: group.sum?.bits ?? 0 });
+				packets.values.push({ labels, value: group.sum?.packets ?? 0 });
+			}
+		}
+
+		return [bits, packets].filter((m) => m.values.length > 0);
 	}
 
 	/**

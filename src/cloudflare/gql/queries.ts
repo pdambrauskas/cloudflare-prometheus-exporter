@@ -536,6 +536,9 @@ export const MagicTransitMetricsQuery = graphql(`
           filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
         ) {
           count
+          avg {
+            tunnelState
+          }
           dimensions {
             active
             datetime
@@ -555,6 +558,90 @@ export const MagicTransitMetricsQuery = graphql(`
 
 // Note: Cloudflare's accounts filter only supports single accountTag, not accountTag_in
 // Use MagicTransitMetricsQuery for individual account queries
+
+export const MagicTransitSLOMetricsQuery = graphql(`
+  query MagicTransitSLOMetrics(
+    $accountID: string!
+    $limit: uint64!
+    $mintime: Time!
+    $maxtime: Time!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        magicTransitTunnelHealthCheckSLOsAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          count
+          avg {
+            effectiveSlo
+            slo
+          }
+          dimensions {
+            tunnelName
+            siteName
+            status
+          }
+        }
+      }
+    }
+  }
+`);
+
+export const MagicTransitTunnelTrafficQuery = graphql(`
+  query MagicTransitTunnelTraffic(
+    $accountID: string!
+    $limit: uint64!
+    $mintime: Time!
+    $maxtime: Time!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        magicTransitTunnelTrafficAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          sum {
+            bits
+            packets
+          }
+          dimensions {
+            tunnelName
+            direction
+            onRamp
+            offRamp
+          }
+        }
+      }
+    }
+  }
+`);
+
+export const MagicFirewallSamplesQuery = graphql(`
+  query MagicFirewallSamples(
+    $accountID: string!
+    $limit: uint64!
+    $mintime: Time!
+    $maxtime: Time!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        magicFirewallSamplesAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          sum {
+            bits
+            packets
+          }
+          dimensions {
+            ruleId
+          }
+        }
+      }
+    }
+  }
+`);
 
 export const RequestMethodMetricsQuery = graphql(`
   query RequestMethodMetrics(
