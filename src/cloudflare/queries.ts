@@ -105,6 +105,8 @@ export function isZoneLevelQuery(query: string): query is ZoneLevelQuery {
 
 /**
  * Query types available on free tier accounts.
+ * Note: Stream queries (stream-video-playback, stream-live-inputs) are
+ * intentionally excluded — Cloudflare Stream is a paid product.
  */
 export const FREE_TIER_QUERIES = [
 	"worker-totals",

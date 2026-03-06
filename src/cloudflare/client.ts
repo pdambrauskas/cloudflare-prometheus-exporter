@@ -1314,7 +1314,7 @@ export class CloudflareMetricsClient {
 
 	/**
 	 * Fetches Cloudflare Stream video playback metrics.
-	 * Returns playback starts and time viewed, grouped by country and device type.
+	 * Returns playback count and time viewed, grouped by country and media type (VOD/live).
 	 *
 	 * @param accountId Cloudflare account ID.
 	 * @param normalizedAccount Normalized account name for labels.
@@ -1339,15 +1339,15 @@ export class CloudflareMetricsClient {
 			return [];
 		}
 
-		const playbackStarts: MetricDefinition = {
-			name: "cloudflare_stream_video_playback_starts_total",
-			help: "Total number of Cloudflare Stream video playback starts",
+		const playbackCount: MetricDefinition = {
+			name: "cloudflare_stream_video_playback_count_total",
+			help: "Total number of adaptive group records for Cloudflare Stream video playback",
 			type: "counter",
 			values: [],
 		};
-		const minutesViewed: MetricDefinition = {
-			name: "cloudflare_stream_video_playback_time_viewed_minutes_total",
-			help: "Total minutes of Cloudflare Stream video viewed",
+		const secondsViewed: MetricDefinition = {
+			name: "cloudflare_stream_video_playback_time_viewed_seconds_total",
+			help: "Total seconds of Cloudflare Stream video viewed",
 			type: "counter",
 			values: [],
 		};
@@ -1363,14 +1363,14 @@ export class CloudflareMetricsClient {
 					media_type: dims.mediaType ?? "",
 				};
 
-				playbackStarts.values.push({ labels, value: group.count ?? 0 });
-				minutesViewed.values.push({
+				playbackCount.values.push({ labels, value: group.count ?? 0 });
+				secondsViewed.values.push({
 					labels,
-					value: group.sum?.minutesViewed ?? 0,
+					value: (group.sum?.minutesViewed ?? 0) * 60,
 				});
 			}
 		}
-		return [playbackStarts, minutesViewed].filter((m) => m.values.length > 0);
+		return [playbackCount, secondsViewed].filter((m) => m.values.length > 0);
 	}
 
 	/**
@@ -1414,8 +1414,8 @@ export class CloudflareMetricsClient {
 			values: [],
 		};
 		const gopDuration: MetricDefinition = {
-			name: "cloudflare_stream_live_input_gop_duration_milliseconds",
-			help: "Average GOP duration for Cloudflare Stream live inputs in milliseconds",
+			name: "cloudflare_stream_live_input_gop_duration_seconds",
+			help: "Average GOP duration for Cloudflare Stream live inputs in seconds",
 			type: "gauge",
 			values: [],
 		};
@@ -1443,7 +1443,7 @@ export class CloudflareMetricsClient {
 				});
 				gopDuration.values.push({
 					labels,
-					value: group.avg?.gopDuration ?? 0,
+					value: (group.avg?.gopDuration ?? 0) / 1000,
 				});
 				uploadRatio.values.push({
 					labels,
